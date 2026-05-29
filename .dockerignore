@@ -1,6 +1,9 @@
 node_modules
-npm-debug.log
+.cache
 .env
+npm-debug.log
+debug_*.png
 .git
 .gitignore
-debug_*.png
+Dockerfile
+.dockerignore

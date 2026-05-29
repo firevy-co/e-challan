@@ -1,9 +1,14 @@
 const startBrowser = require("../utils/browser");
 const cheerio = require("cheerio");
 const { v4: uuidv4 } = require("uuid");
+const { getVehicleRecord, saveVehicleRecord } = require("../utils/persistentDb");
 
 // Global session store to keep Puppeteer pages alive between OTP requests
 const sessions = new Map();
+
+// Cache to store successfully fetched challan results for 5 minutes
+const challanCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes in milliseconds
 
 /*
 |--------------------------------------------------------------------------
@@ -11,6 +16,37 @@ const sessions = new Map();
 |--------------------------------------------------------------------------
 */
 const requestVehicleOtp = async (vehicleNumber, mobileNumber) => {
+    // 0. Check persistent limit first
+    const record = getVehicleRecord(vehicleNumber);
+    if (record && record.count >= 3) {
+        console.log(`[Limit Reached] Returning permanently cached challan details for vehicle: ${vehicleNumber}`);
+        return {
+            success: true,
+            fromCache: true,
+            data: record.lastData
+        };
+    }
+
+    // 1. Check if we have cached challan details for this vehicle
+    const cached = challanCache.get(vehicleNumber);
+    if (cached && (Date.now() - cached.createdAt < CACHE_TTL)) {
+        console.log(`[Cache Hit] Returning cached challan details for vehicle: ${vehicleNumber}`);
+        return {
+            success: true,
+            fromCache: true,
+            data: cached.data
+        };
+    }
+
+    // 2. Clean up any existing duplicate session for the same vehicle
+    for (const [id, session] of sessions.entries()) {
+        if (session.vehicleNumber === vehicleNumber) {
+            console.log(`[Session Cleanup] Closing previous duplicate page/session for vehicle: ${vehicleNumber}`);
+            await session.page.close().catch(() => {});
+            sessions.delete(id);
+        }
+    }
+
     let browser = null;
     let page = null;
 
@@ -18,23 +54,66 @@ const requestVehicleOtp = async (vehicleNumber, mobileNumber) => {
         browser = await startBrowser();
         page = await browser.newPage();
 
+        // 3. Enable request interception to block images, fonts, media, and ads/trackers
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            const resourceType = req.resourceType();
+            const url = req.url().toLowerCase();
+
+            const shouldBlock = 
+                ['image', 'font', 'media'].includes(resourceType) ||
+                url.includes('google-analytics') || 
+                url.includes('doubleclick') || 
+                url.includes('facebook') || 
+                url.includes('googleadservices') || 
+                url.includes('googlesyndication') || 
+                url.includes('adservice') ||
+                url.includes('coinhive') ||
+                url.includes('track');
+
+            if (shouldBlock) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
         const targetUrl = `https://vehicleinfo.app/challan-details/${vehicleNumber}?rc_no=${vehicleNumber}`;
         
         await page.goto(targetUrl, {
-            waitUntil: "networkidle2",
+            waitUntil: "domcontentloaded",
             timeout: 60000
         });
 
-        // Check if there's a login button (if there isn't, maybe no challans exist or it's free)
-        const loginBtnSelector = '.cdl-more button';
-        const loginBtnExists = await page.$(loginBtnSelector).catch(() => null);
+        let loginBtnExists = null;
+        try {
+            await page.waitForFunction(() => {
+                const btns = Array.from(document.querySelectorAll('button'));
+                return btns.some(b => b.innerText && b.innerText.toUpperCase().includes('LOGIN TO CONTINUE')) || document.querySelector('.cdl-items-card');
+            }, { timeout: 15000 });
+            
+            loginBtnExists = await page.evaluateHandle(() => {
+                return Array.from(document.querySelectorAll('button')).find(b => b.innerText && b.innerText.toUpperCase().includes('LOGIN TO CONTINUE'));
+            });
+            
+            const isUndefined = await loginBtnExists.evaluate(b => b === undefined);
+            if (isUndefined) loginBtnExists = null;
+        } catch (e) {
+            console.log("Timeout waiting for login button or challan list");
+        }
         
         if (loginBtnExists) {
+            // Wait a brief moment to ensure React is fully hydrated and event handlers are attached
+            await new Promise(r => setTimeout(r, 1500));
+
             // Use DOM click to bypass any overlay ads that might block native Puppeteer clicks
-            await page.evaluate(b => b.click(), loginBtnExists);
+            await loginBtnExists.evaluate(b => b.click());
             
-            // Wait for modal and phone input
-            await page.waitForSelector('input[type="tel"]', { timeout: 10000, visible: true });
+            // Wait for modal and phone input to appear in the DOM (visible: true is omitted to avoid CSS transition animation race conditions)
+            await page.waitForSelector('input[type="tel"]', { timeout: 15000 });
+            
+            // Wait a moment for transition animations to finish and inputs to be ready
+            await new Promise(r => setTimeout(r, 500));
             
             // Type mobile number
             await page.type('input[type="tel"]', mobileNumber);
@@ -75,10 +154,31 @@ const requestVehicleOtp = async (vehicleNumber, mobileNumber) => {
         } else {
             // No login button means we can just scrape directly or no challans exist
             // Let's close the browser since we don't need to wait for OTP
+            
+            console.log("No login button found. Attempting to fetch challans directly...");
+            const details = await extractChallanData(page, vehicleNumber);
+            
             await page.close();
+            
+            // Save successfully fetched data to cache
+            const resultData = {
+                vehicleNumber,
+                totalChallans: details.length,
+                details
+            };
+            
+            // Save to persistent database
+            saveVehicleRecord(vehicleNumber, resultData);
+
+            challanCache.set(vehicleNumber, {
+                data: resultData,
+                createdAt: Date.now()
+            });
+
             return {
-                success: false,
-                message: "No login required or no challans found for this vehicle. Try fetching directly."
+                success: true,
+                fromCache: true,
+                data: resultData
             };
         }
 
@@ -145,40 +245,30 @@ const verifyVehicleOtpAndFetch = async (sessionId, otp) => {
         await page.screenshot({ path: 'debug_after_reload.png' });
 
         // Now we scrape the uncensored data
-        const html = await page.content();
-        const $ = cheerio.load(html);
-
-        const details = [];
-
-        $('.cdl-items-card').each((i, el) => {
-            // Uncensored challan number should now be visible in .cdl-no (remove fallback to .cdl-blur which causes ####)
-            const challanText = $(el).find('.cdl-no').text().replace('Challan', '').trim();
-            const challanBlurText = $(el).find('.cdl-blur').text().trim();
-            const challanNo = challanText || challanBlurText;
-            
-            const date = $(el).find('.cdl-date').text().replace('Issued Date', '').trim();
-            const offence = $(el).find('.cdl-Offence').text().replace('Offence:', '').trim();
-            const amount = $(el).find('.cdl-amount p').text().trim();
-            const status = $(el).closest('.cdl-items').find('.cdl-header-content-text h6').text().trim() || "Pending";
-
-            details.push({
-                challanNumber: challanNo,
-                date: date,
-                offence: offence,
-                amount: amount,
-                status: status
-            });
-        });
+        const details = await extractChallanData(page, vehicleNumber);
 
         // Cleanup session
         sessions.delete(sessionId);
         await page.close().catch(() => {});
 
-        return {
-            success: true,
+        // Save successfully fetched data to cache
+        const resultData = {
             vehicleNumber,
             totalChallans: details.length,
             details
+        };
+
+        // Save to persistent database
+        saveVehicleRecord(vehicleNumber, resultData);
+
+        challanCache.set(vehicleNumber, {
+            data: resultData,
+            createdAt: Date.now()
+        });
+
+        return {
+            success: true,
+            ...resultData
         };
 
     } catch (error) {
@@ -189,16 +279,56 @@ const verifyVehicleOtpAndFetch = async (sessionId, otp) => {
     }
 };
 
-// Cleanup old sessions periodically (every 10 minutes)
+// Cleanup old sessions and expired cache entries periodically (every 1 minute)
 setInterval(() => {
     const now = Date.now();
+    
+    // Cleanup sessions older than 3 minutes
     for (const [id, session] of sessions.entries()) {
-        if (now - session.createdAt > 10 * 60 * 1000) { // 10 minutes expiry
+        if (now - session.createdAt > 3 * 60 * 1000) { // 3 minutes expiry
+            console.log(`[Session Expiry] Closing expired page for session: ${id}`);
             session.page.close().catch(() => {});
             sessions.delete(id);
         }
     }
+
+    // Cleanup expired cache entries
+    for (const [key, value] of challanCache.entries()) {
+        // Cache expires after 5 minutes
+        if (now - value.createdAt > 5 * 60 * 1000) {
+            challanCache.delete(key);
+        }
+    }
 }, 60000);
+
+// Helper function to extract challan data from the page using Cheerio
+async function extractChallanData(page, vehicleNumber) {
+    const html = await page.content();
+    const $ = cheerio.load(html);
+
+    const details = [];
+
+    $('.cdl-items-card').each((i, el) => {
+        const challanText = $(el).find('.cdl-no').text().replace('Challan', '').trim();
+        const challanBlurText = $(el).find('.cdl-blur').text().trim();
+        const challanNo = challanText || challanBlurText;
+        
+        const date = $(el).find('.cdl-date').text().replace('Issued Date', '').trim();
+        const offence = $(el).find('.cdl-Offence').text().replace('Offence:', '').trim();
+        const amount = $(el).find('.cdl-amount p').text().trim();
+        const status = $(el).closest('.cdl-items').find('.cdl-header-content-text h6').text().trim() || "Pending";
+
+        details.push({
+            challanNumber: challanNo,
+            date: date,
+            offence: offence,
+            amount: amount,
+            status: status
+        });
+    });
+
+    return details;
+}
 
 module.exports = {
     requestVehicleOtp,

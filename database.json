@@ -1,0 +1,25 @@
+{
+  "GJ05CH2906": {
+    "count": 3,
+    "lastData": {
+      "vehicleNumber": "GJ05CH2906",
+      "totalChallans": 2,
+      "details": [
+        {
+          "challanNumber": "##########",
+          "date": "01 Mar, 2023",
+          "offence": "FAILURE TO USE SAFETY BELTS WHILE DRIVING - OTHER THAN TWO THREE WHEELER / વાહન હંકારતી વખતે સેફટી બેલ્ટનો ઉપયોગ ન કરે - ટુ થ્રી વ્હીલર સિવાય",
+          "amount": "₹500",
+          "status": "Pending in Court"
+        },
+        {
+          "challanNumber": "##########",
+          "date": "28 May, 2023",
+          "offence": "FAILURE TO USE SAFETY BELTS WHILE DRIVING - OTHER THAN TWO THREE WHEELER / વાહન હંકારતી વખતે સેફટી બેલ્ટનો ઉપયોગ ન કરે - ટુ થ્રી વ્હીલર સિવાય",
+          "amount": "₹500",
+          "status": "Pending in Court"
+        }
+      ]
+    }
+  }
+}

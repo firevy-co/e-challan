@@ -365,7 +365,11 @@
                     throw new Error(result.message || 'Failed to request OTP');
                 }
 
-                if (result.sessionId) {
+                if (result.fromCache && result.data) {
+                    // Bypass OTP and show cached results directly
+                    requestCard.style.display = 'none';
+                    renderResults(result.data, true);
+                } else if (result.sessionId) {
                     // Show OTP form
                     currentSessionId = result.sessionId;
                     requestCard.style.display = 'none';
@@ -435,7 +439,7 @@
             location.reload();
         });
 
-        function renderResults(data) {
+        function renderResults(data, isCached = false) {
             let html = '';
 
             if (data.totalChallans === 0) {
@@ -443,6 +447,7 @@
                     <div class="summary-card clean">
                         <h2 style="color: #4ade80;">All Clear! 🎉</h2>
                         <p>No pending challans found for ${data.vehicleNumber}</p>
+                        ${isCached ? '<div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0.5rem; display: flex; align-items: center; justify-content: center; gap: 0.25rem;"><span>⚡</span><span>Loaded instantly from cache</span></div>' : ''}
                     </div>
                 `;
             } else {
@@ -450,6 +455,7 @@
                     <div class="summary-card">
                         <h2 style="color: #f87171;">${data.totalChallans} Pending Challan(s)</h2>
                         <p>Action required for ${data.vehicleNumber}</p>
+                        ${isCached ? '<div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0.5rem; display: flex; align-items: center; justify-content: center; gap: 0.25rem;"><span>⚡</span><span>Loaded instantly from cache</span></div>' : ''}
                     </div>
                 `;
 
